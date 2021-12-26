@@ -1,0 +1,156 @@
+#!/usr/bin/env python3
+import argparse
+import subprocess
+import datetime
+import sys
+import os
+import traceback
+
+
+class DrillerTermException(Exception):
+    def __init__(self, msg):
+        super(DrillerTermException, self).__init__(msg)
+
+
+class Context(object):
+    def __init__(self):
+        self.netns_symlink = None
+
+    def cleanup(self):
+        self.remove_netns_symlink()
+
+    def remove_netns_symlink(self):
+        if self.netns_symlink is None:
+            return
+
+        os.remove(self.netns_symlink)
+        print(f'Removed: {self.netns_symlink}')
+
+
+def show_parameters(args):
+    print(f'Container: {args.container}')
+    print(f'veth (host)     : {args.veth_name_host}')
+    print(f'veth (container): {args.veth_name_dest}')
+
+
+def get_container_pid(args):
+    cmd = ['docker', 'inspect', args.container, '--format', '{{.State.Pid}}']
+    result = subprocess.run(cmd, stdout=subprocess.PIPE, check=True,
+                            encoding='utf8')
+    pid = result.stdout.strip()
+    if not pid.isdecimal():
+        raise DrillerTermException(f'Unexpected PID: "{pid}"')
+
+    print(f'PID: {pid}')
+    args.pid = pid
+
+
+def link_container_netns(ctx, args):
+    NETNS_DIR='/var/run/netns'
+    os.makedirs(NETNS_DIR, exist_ok=True)
+
+    src = f'{NETNS_DIR}/{args.netns_name}'
+    dst = f'/proc/{args.pid}/ns/net'
+    os.symlink(dst, src)
+
+    ctx.netns_symlink = src
+    print(f'Created: {ctx.netns_symlink} -> {dst}')
+
+
+def create_veth_pair(args):
+    cmd = ['ip', 'link', 'add', args.veth_name_host,
+           'type', 'veth', 'peer', 'name', args.veth_name_dest]
+    subprocess.run(cmd, check=True)
+
+
+def move_veth_to_container(args):
+    cmd = ['ip', 'link', 'set', args.veth_name_dest, 'netns',
+           args.netns_name, 'up']
+    subprocess.run(cmd, check=True)
+
+
+def set_ipaddr_to_container_veth(args):
+    cmd = ['ip', 'netns', 'exec', args.netns_name,
+           'ip', 'addr', 'add', args.ipv4_addr, 'dev', args.veth_name_dest]
+    subprocess.run(cmd, check=True)
+    print(f'IP addr: {args.ipv4_addr}')
+
+
+def set_container_default_gw(args):
+    if args.gateway is None:
+        print(f'Gateway: None')
+        return
+
+    cmd = ['ip', 'netns', 'exec', args.netns_name,
+           'ip', 'route', 'add', 'default', 'via', args.gateway]
+    subprocess.run(cmd, check=True)
+    print(f'Gateway: {args.gateway}')
+
+
+def add_veth_to_host_bridge(args):
+    cmd = ['brctl', 'addif', args.bridge, args.veth_name_host]
+    subprocess.run(cmd, check=True)
+
+
+def up_host_veth(args):
+    cmd = ['ip', 'link', 'set', args.veth_name_host, 'up']
+    subprocess.run(cmd, check=True)
+
+
+def set_iptables(args):
+    for opt in ('in', 'out'):
+        cmd = ['iptables', '-A', 'FORWARD', '-m', 'physdev',
+               f'--physdev-{opt}', args.veth_name_host, '-j', 'ACCEPT']
+        subprocess.run(cmd, check=True)
+
+
+def run(ctx):
+    args = ctx.args
+
+    show_parameters(args)
+    get_container_pid(args)
+    link_container_netns(ctx, args)
+
+    create_veth_pair(args)
+
+    move_veth_to_container(args)
+    set_ipaddr_to_container_veth(args)
+    set_container_default_gw(args)
+
+    add_veth_to_host_bridge(args)
+    up_host_veth(args)
+
+    set_iptables(args)
+
+
+def fixup_args(args):
+    if args.veth_name is None:
+        d = datetime.datetime.now()
+        args.veth_name = d.strftime('vdr%m%d%H%M%S')
+
+    args.veth_name_host = args.veth_name + '-a'
+    args.veth_name_dest = args.veth_name + '-b'
+    args.netns_name = args.container
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument('container', help='ID of the docker container')
+    parser.add_argument('-n', '--veth-name')
+    parser.add_argument('-b', '--bridge')
+    parser.add_argument('-a' , '--ipv4-addr')
+    parser.add_argument('-g' , '--gateway')
+    args = parser.parse_args()
+
+    fixup_args(args)
+    ctx = Context()
+    ctx.args = args
+
+    try:
+        run(ctx)
+    finally:
+        ctx.cleanup()
+
+
+if __name__ == '__main__':
+    main()
